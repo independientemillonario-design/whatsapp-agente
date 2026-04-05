@@ -1,31 +1,34 @@
-import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys'
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, makeCacheableSignalKeyStore } from '@whiskeysockets/baileys'
 import Anthropic from '@anthropic-ai/sdk'
 import pino from 'pino'
 import cron from 'node-cron'
 import { Boom } from '@hapi/boom'
 import { createServer } from 'http'
-import QRCode from 'qrcode'
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 const CLICKUP_TOKEN = process.env.CLICKUP_TOKEN
 const CLICKUP_LIST_ID = process.env.CLICKUP_LIST_ID
 const REPORT_PHONE = process.env.REPORT_PHONE
+const PHONE_NUMBER = process.env.PHONE_NUMBER
 const PORT = process.env.PORT || 3000
 
-let qrActual = null
+let pairingCode = null
+let estadoConexion = 'esperando'
 
-const server = createServer(async (req, res) => {
-  if (qrActual) {
-    const qrImg = await QRCode.toDataURL(qrActual)
-    res.writeHead(200, { 'Content-Type': 'text/html' })
-    res.end(`<html><head><meta http-equiv="refresh" content="5"></head><body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;background:#111;color:#fff"><h2>Escanea con WhatsApp</h2><img src="${qrImg}" style="width:300px;height:300px"/><p>Abre WhatsApp > Dispositivos vinculados > Vincular dispositivo</p></body></html>`)
-  } else {
-    res.writeHead(200, { 'Content-Type': 'text/html' })
-    res.end(`<html><head><meta http-equiv="refresh" content="3"></head><body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;background:#111;color:#fff"><h2>Esperando QR...</h2><p style="color:#888">Esta página se actualiza sola cada 3 segundos</p></body></html>`)
+const server = createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/html' })
+  const html = `<html><head><meta http-equiv="refresh" content="4"><style>body{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;background:#111;color:#fff;margin:0}.code{font-size:48px;font-weight:bold;letter-spacing:12px;color:#25D366;background:#1a1a1a;padding:24px 40px;border-radius:16px;margin:24px 0}.status{color:#888;font-size:14px}</style></head><body>
+  ${estadoConexion === 'conectado' 
+    ? '<h2>✅ Conectado a WhatsApp</h2><p class="status">El agente está activo y escuchando mensajes</p>'
+    : pairingCode 
+      ? `<h2>Ingresa este código en WhatsApp</h2><div class="code">${pairingCode}</div><p>WhatsApp → Dispositivos vinculados → Vincular con número de teléfono</p><p class="status">El código expira en 60 segundos — esta página se actualiza sola</p>`
+      : '<h2>Iniciando sistema...</h2><p class="status">Esta página se actualiza sola cada 4 segundos</p>'
   }
+  </body></html>`
+  res.end(html)
 })
 
-server.listen(PORT, () => console.log(`Servidor QR en puerto ${PORT}`))
+server.listen(PORT, () => console.log(`Servidor en puerto ${PORT}`))
 
 const PROMPT_SISTEMA = `Eres un agente experto en gestión de proyectos. Analiza el mensaje de WhatsApp y determina si contiene tareas, compromisos, pendientes o accionables. Si encuentras tareas, responde SOLO con JSON válido: {"hay_tareas":true,"tareas":[{"titulo":"título corto","descripcion":"detalle completo","responsable":"nombre o Sin asignar","prioridad":"urgente|alta|normal|baja","fecha_limite":"DD/MM/YYYY o null"}]}. Si NO hay tareas: {"hay_tareas":false}. Responde SOLO el JSON sin texto adicional.`
 
@@ -72,7 +75,6 @@ async function obtenerTareasPendientes() {
     const data = await res.json()
     return data.tasks || []
   } catch (e) {
-    console.error('Error obteniendo tareas:', e.message)
     return []
   }
 }
@@ -105,27 +107,41 @@ async function generarReporteDiario(sock) {
 async function conectarWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('auth')
   const sock = makeWASocket({
-    auth: state,
-    logger: pino({ level: 'silent' })
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
+    },
+    logger: pino({ level: 'silent' }),
+    printQRInTerminal: false
   })
 
   sock.ev.on('creds.update', saveCreds)
 
   sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update
-    if (qr) {
-      qrActual = qr
-      console.log('QR generado — abre la URL del servicio para escanearlo')
+    const { connection, lastDisconnect } = update
+
+    if (!sock.authState.creds.registered && PHONE_NUMBER) {
+      await new Promise(r => setTimeout(r, 3000))
+      try {
+        const numero = PHONE_NUMBER.replace(/[^0-9]/g, '')
+        pairingCode = await sock.requestPairingCode(numero)
+        console.log(`Código de emparejamiento: ${pairingCode}`)
+      } catch (e) {
+        console.error('Error generando código:', e.message)
+      }
     }
+
     if (connection === 'close') {
-      qrActual = null
+      pairingCode = null
+      estadoConexion = 'esperando'
       const reconectar = (lastDisconnect?.error instanceof Boom)
         ? lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut
         : true
-      if (reconectar) conectarWhatsApp()
+      if (reconectar) setTimeout(conectarWhatsApp, 5000)
     } else if (connection === 'open') {
-      qrActual = null
-      console.log('WhatsApp conectado')
+      pairingCode = null
+      estadoConexion = 'conectado'
+      console.log('WhatsApp conectado exitosamente')
       cron.schedule('0 8 * * *', () => generarReporteDiario(sock), { timezone: 'America/Bogota' })
     }
   })
