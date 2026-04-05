@@ -1,4 +1,4 @@
-import makeWASocket, { useMultiFileAuthState, DisconnectReason, downloadMediaMessage } from '@whiskeysockets/baileys'
+import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys'
 import Anthropic from '@anthropic-ai/sdk'
 import pino from 'pino'
 import qrcode from 'qrcode-terminal'
@@ -10,79 +10,40 @@ const CLICKUP_TOKEN = process.env.CLICKUP_TOKEN
 const CLICKUP_LIST_ID = process.env.CLICKUP_LIST_ID
 const REPORT_PHONE = process.env.REPORT_PHONE
 
-const PROMPT_SISTEMA = `Eres un agente experto en gestión de proyectos. Analiza el mensaje de WhatsApp que recibes y determina si contiene tareas, compromisos, pendientes o accionables.
-
-Si encuentras tareas, responde SOLO con un JSON válido con este formato exacto:
-{
-  "hay_tareas": true,
-  "tareas": [
-    {
-      "titulo": "título corto y claro de la tarea",
-      "descripcion": "detalle completo de la tarea",
-      "responsable": "nombre de la persona asignada o 'Sin asignar'",
-      "prioridad": "urgente|alta|normal|baja",
-      "fecha_limite": "DD/MM/YYYY o null si no se menciona"
-    }
-  ]
-}
-
-Si NO hay tareas, responde SOLO con:
-{ "hay_tareas": false }
-
-Reglas:
-- Extrae TODAS las tareas aunque sean implícitas
-- Infiere el responsable del contexto si no se menciona explícitamente
-- Prioridad urgente: hay fecha límite próxima o palabras como "ya", "ahora", "urgente"
-- Prioridad alta: palabras como "importante", "necesito", "asegúrate"
-- No incluyas conversación casual sin accionables
-- Responde SOLO el JSON, sin texto adicional`
+const PROMPT_SISTEMA = `Eres un agente experto en gestión de proyectos. Analiza el mensaje de WhatsApp y determina si contiene tareas, compromisos, pendientes o accionables. Si encuentras tareas, responde SOLO con JSON válido: {"hay_tareas":true,"tareas":[{"titulo":"título corto","descripcion":"detalle completo","responsable":"nombre o Sin asignar","prioridad":"urgente|alta|normal|baja","fecha_limite":"DD/MM/YYYY o null"}]}. Si NO hay tareas: {"hay_tareas":false}. Responde SOLO el JSON sin texto adicional.`
 
 async function analizarMensaje(texto, remitente, grupo) {
   try {
     const respuesta = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 1000,
-      messages: [{
-        role: 'user',
-        content: `Grupo/Chat: ${grupo}\nRemitente: ${remitente}\nMensaje: ${texto}`
-      }],
-      system: PROMPT_SISTEMA
+      system: PROMPT_SISTEMA,
+      messages: [{ role: 'user', content: `Grupo: ${grupo}\nRemitente: ${remitente}\nMensaje: ${texto}` }]
     })
-    const contenido = respuesta.content[0].text.trim()
-    return JSON.parse(contenido)
+    return JSON.parse(respuesta.content[0].text.trim())
   } catch (e) {
-    console.error('Error analizando mensaje:', e.message)
+    console.error('Error analizando:', e.message)
     return { hay_tareas: false }
   }
 }
 
-async function crearTareaClickUp(tarea, contexto) {
+async function crearTareaClickUp(tarea, ctx) {
   const prioridades = { urgente: 1, alta: 2, normal: 3, baja: 4 }
-  const cuerpo = {
-    name: tarea.titulo,
-    description: `${tarea.descripcion}\n\n---\nOrigen: ${contexto.grupo}\nRemitente: ${contexto.remitente}\nFecha: ${contexto.fecha}`,
-    priority: prioridades[tarea.prioridad] || 3,
-    assignees: [],
-    due_date: tarea.fecha_limite ? parsearFecha(tarea.fecha_limite) : null
-  }
   try {
     const res = await fetch(`https://api.clickup.com/api/v2/list/${CLICKUP_LIST_ID}/task`, {
       method: 'POST',
       headers: { 'Authorization': CLICKUP_TOKEN, 'Content-Type': 'application/json' },
-      body: JSON.stringify(cuerpo)
+      body: JSON.stringify({
+        name: tarea.titulo,
+        description: `${tarea.descripcion}\n\nOrigen: ${ctx.grupo}\nRemitente: ${ctx.remitente}\nFecha: ${ctx.fecha}`,
+        priority: prioridades[tarea.prioridad] || 3
+      })
     })
     const data = await res.json()
-    console.log(`✅ Tarea creada: ${tarea.titulo} (ID: ${data.id})`)
-    return data
+    console.log(`Tarea creada: ${tarea.titulo} (${data.id})`)
   } catch (e) {
-    console.error('Error creando tarea en ClickUp:', e.message)
+    console.error('Error en ClickUp:', e.message)
   }
-}
-
-function parsearFecha(fechaStr) {
-  if (!fechaStr) return null
-  const [dia, mes, anio] = fechaStr.split('/')
-  return new Date(`${anio}-${mes}-${dia}`).getTime()
 }
 
 async function obtenerTareasPendientes() {
@@ -100,28 +61,87 @@ async function obtenerTareasPendientes() {
 }
 
 async function generarReporteDiario(sock) {
-  console.log('📊 Generando reporte diario...')
+  console.log('Generando reporte diario...')
   const tareas = await obtenerTareasPendientes()
-  if (tareas.length === 0) {
-    const msg = '📊 *Reporte diario*\n\n✅ No hay tareas pendientes. ¡Todo al día!'
-    if (REPORT_PHONE) await sock.sendMessage(`${REPORT_PHONE}@s.whatsapp.net`, { text: msg })
+  const fecha = new Date().toLocaleDateString('es-CO', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
+
+  if (!tareas.length) {
+    if (REPORT_PHONE) await sock.sendMessage(`${REPORT_PHONE}@s.whatsapp.net`, { text: `*Reporte diario ${fecha}*\n\nNo hay tareas pendientes.` })
     return
   }
 
-  const prioridadLabel = { 1: '🔴 Urgente', 2: '🟠 Alta', 3: '🟡 Normal', 4: '🟢 Baja' }
-  let reporte = `📊 *Reporte diario de tareas*\n_${new Date().toLocaleDateString('es-CO', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}_\n\n`
-  reporte += `*Total pendientes: ${tareas.length}*\n\n`
-
+  const labels = { 1: 'Urgente', 2: 'Alta', 3: 'Normal', 4: 'Baja' }
   const agrupadas = {}
-  for (const tarea of tareas) {
-    const asignado = tarea.assignees?.[0]?.username || 'Sin asignar'
-    if (!agrupadas[asignado]) agrupadas[asignado] = []
-    agrupadas[asignado].push(tarea)
+  for (const t of tareas) {
+    const p = t.assignees?.[0]?.username || 'Sin asignar'
+    if (!agrupadas[p]) agrupadas[p] = []
+    agrupadas[p].push(t)
   }
 
-  for (const [persona, tareasPer] of Object.entries(agrupadas)) {
-    reporte += `👤 *${persona}*\n`
-    const ordenadas = tareasPer.sort((a, b) => (a.priority?.priority || 3) - (b.priority?.priority || 3))
-    for (const t of ordenadas) {
-      const pri = prioridadLabel[t.priority?.priority] || '🟡 Normal'
-      const fecha = t.due_date ? ` ·
+  let msg = `*Reporte diario de tareas*\n_${fecha}_\n*Total: ${tareas.length}*\n\n`
+  for (const [persona, ts] of Object.entries(agrupadas)) {
+    msg += `*${persona}*\n`
+    for (const t of ts.sort((a, b) => (a.priority?.priority || 3) - (b.priority?.priority || 3))) {
+      msg += `  [${labels[t.priority?.priority] || 'Normal'}] ${t.name}\n`
+    }
+    msg += '\n'
+  }
+
+  if (REPORT_PHONE) await sock.sendMessage(`${REPORT_PHONE}@s.whatsapp.net`, { text: msg })
+  console.log('Reporte enviado')
+}
+
+async function conectarWhatsApp() {
+  const { state, saveCreds } = await useMultiFileAuthState('auth')
+  const sock = makeWASocket({
+    auth: state,
+    logger: pino({ level: 'silent' }),
+    printQRInTerminal: true
+  })
+
+  sock.ev.on('creds.update', saveCreds)
+
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update
+    if (qr) {
+      console.log('\nESCANEA ESTE QR CON WHATSAPP:\n')
+      qrcode.generate(qr, { small: true })
+    }
+    if (connection === 'close') {
+      const reconectar = (lastDisconnect?.error instanceof Boom)
+        ? lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut
+        : true
+      if (reconectar) conectarWhatsApp()
+    } else if (connection === 'open') {
+      console.log('WhatsApp conectado')
+      cron.schedule('0 8 * * *', () => generarReporteDiario(sock), { timezone: 'America/Bogota' })
+    }
+  })
+
+  sock.ev.on('messages.upsert', async ({ messages }) => {
+    for (const msg of messages) {
+      if (msg.key.fromMe || !msg.message) continue
+      const remitente = msg.pushName || msg.key.participant || 'Desconocido'
+      const grupo = msg.key.remoteJid
+      const fecha = new Date(msg.messageTimestamp * 1000).toLocaleString('es-CO', { timeZone: 'America/Bogota' })
+      const m = msg.message
+
+      let texto = m.conversation || m.extendedTextMessage?.text ||
+        (m.imageMessage ? `[Imagen] ${m.imageMessage.caption || ''}` : '') ||
+        (m.documentMessage ? `[Documento: ${m.documentMessage.fileName}]` : '') ||
+        (m.audioMessage ? '[Audio recibido]' : '')
+
+      if (!texto || texto.length < 5) continue
+      console.log(`Mensaje de ${remitente}: ${texto.substring(0, 60)}`)
+
+      const resultado = await analizarMensaje(texto, remitente, grupo)
+      if (resultado.hay_tareas && resultado.tareas?.length) {
+        for (const tarea of resultado.tareas) {
+          await crearTareaClickUp(tarea, { grupo, remitente, fecha })
+        }
+      }
+    }
+  })
+}
+
+conectarWhatsApp()
