@@ -16,7 +16,7 @@ let pairingCode = null
 let estadoConexion = 'esperando'
 
 const server = createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/html' })
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
   const html = `<html><head><meta http-equiv="refresh" content="4"><style>body{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;background:#111;color:#fff;margin:0}.code{font-size:48px;font-weight:bold;letter-spacing:12px;color:#25D366;background:#1a1a1a;padding:24px 40px;border-radius:16px;margin:24px 0}.status{color:#888;font-size:14px}</style></head><body>
   ${estadoConexion === 'conectado' 
     ? '<h2>✅ Conectado a WhatsApp</h2><p class="status">El agente está activo y escuchando mensajes</p>'
@@ -120,14 +120,16 @@ async function conectarWhatsApp() {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect } = update
 
-    if (!sock.authState.creds.registered && PHONE_NUMBER) {
-      await new Promise(r => setTimeout(r, 3000))
+    if (!sock.authState.creds.registered && PHONE_NUMBER && !pairingCode) {
+      await new Promise(r => setTimeout(r, 5000))
       try {
         const numero = PHONE_NUMBER.replace(/[^0-9]/g, '')
         pairingCode = await sock.requestPairingCode(numero)
-        console.log(`Código de emparejamiento: ${pairingCode}`)
+        estadoConexion = 'esperando_codigo'
+        console.log(`Codigo generado: ${pairingCode}`)
       } catch (e) {
-        console.error('Error generando código:', e.message)
+        console.error('Error:', e.message)
+        setTimeout(conectarWhatsApp, 8000)
       }
     }
 
