@@ -1,14 +1,31 @@
 import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys'
 import Anthropic from '@anthropic-ai/sdk'
 import pino from 'pino'
-import qrcode from 'qrcode-terminal'
 import cron from 'node-cron'
 import { Boom } from '@hapi/boom'
+import { createServer } from 'http'
+import QRCode from 'qrcode'
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 const CLICKUP_TOKEN = process.env.CLICKUP_TOKEN
 const CLICKUP_LIST_ID = process.env.CLICKUP_LIST_ID
 const REPORT_PHONE = process.env.REPORT_PHONE
+const PORT = process.env.PORT || 3000
+
+let qrActual = null
+
+const server = createServer(async (req, res) => {
+  if (qrActual) {
+    const qrImg = await QRCode.toDataURL(qrActual)
+    res.writeHead(200, { 'Content-Type': 'text/html' })
+    res.end(`<html><body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;background:#111;color:#fff"><h2>Escanea con WhatsApp</h2><img src="${qrImg}" style="width:300px;height:300px"/><p>Abre WhatsApp > Dispositivos vinculados > Vincular dispositivo</p></body></html>`)
+  } else {
+    res.writeHead(200, { 'Content-Type': 'text/html' })
+    res.end(`<html><body style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;background:#111;color:#fff"><h2>Conectado a WhatsApp</h2></body></html>`)
+  }
+})
+
+server.listen(PORT, () => console.log(`Servidor QR en puerto ${PORT}`))
 
 const PROMPT_SISTEMA = `Eres un agente experto en gestión de proyectos. Analiza el mensaje de WhatsApp y determina si contiene tareas, compromisos, pendientes o accionables. Si encuentras tareas, responde SOLO con JSON válido: {"hay_tareas":true,"tareas":[{"titulo":"título corto","descripcion":"detalle completo","responsable":"nombre o Sin asignar","prioridad":"urgente|alta|normal|baja","fecha_limite":"DD/MM/YYYY o null"}]}. Si NO hay tareas: {"hay_tareas":false}. Responde SOLO el JSON sin texto adicional.`
 
@@ -61,15 +78,12 @@ async function obtenerTareasPendientes() {
 }
 
 async function generarReporteDiario(sock) {
-  console.log('Generando reporte diario...')
   const tareas = await obtenerTareasPendientes()
   const fecha = new Date().toLocaleDateString('es-CO', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
-
   if (!tareas.length) {
     if (REPORT_PHONE) await sock.sendMessage(`${REPORT_PHONE}@s.whatsapp.net`, { text: `*Reporte diario ${fecha}*\n\nNo hay tareas pendientes.` })
     return
   }
-
   const labels = { 1: 'Urgente', 2: 'Alta', 3: 'Normal', 4: 'Baja' }
   const agrupadas = {}
   for (const t of tareas) {
@@ -77,8 +91,7 @@ async function generarReporteDiario(sock) {
     if (!agrupadas[p]) agrupadas[p] = []
     agrupadas[p].push(t)
   }
-
-  let msg = `*Reporte diario de tareas*\n_${fecha}_\n*Total: ${tareas.length}*\n\n`
+  let msg = `*Reporte diario*\n_${fecha}_\n*Total: ${tareas.length}*\n\n`
   for (const [persona, ts] of Object.entries(agrupadas)) {
     msg += `*${persona}*\n`
     for (const t of ts.sort((a, b) => (a.priority?.priority || 3) - (b.priority?.priority || 3))) {
@@ -86,17 +99,14 @@ async function generarReporteDiario(sock) {
     }
     msg += '\n'
   }
-
   if (REPORT_PHONE) await sock.sendMessage(`${REPORT_PHONE}@s.whatsapp.net`, { text: msg })
-  console.log('Reporte enviado')
 }
 
 async function conectarWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('auth')
   const sock = makeWASocket({
     auth: state,
-    logger: pino({ level: 'silent' }),
-    printQRInTerminal: true
+    logger: pino({ level: 'silent' })
   })
 
   sock.ev.on('creds.update', saveCreds)
@@ -104,15 +114,17 @@ async function conectarWhatsApp() {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update
     if (qr) {
-      console.log('\nESCANEA ESTE QR CON WHATSAPP:\n')
-      qrcode.generate(qr, { small: true })
+      qrActual = qr
+      console.log('QR generado — abre la URL del servicio para escanearlo')
     }
     if (connection === 'close') {
+      qrActual = null
       const reconectar = (lastDisconnect?.error instanceof Boom)
         ? lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut
         : true
       if (reconectar) conectarWhatsApp()
     } else if (connection === 'open') {
+      qrActual = null
       console.log('WhatsApp conectado')
       cron.schedule('0 8 * * *', () => generarReporteDiario(sock), { timezone: 'America/Bogota' })
     }
@@ -125,15 +137,11 @@ async function conectarWhatsApp() {
       const grupo = msg.key.remoteJid
       const fecha = new Date(msg.messageTimestamp * 1000).toLocaleString('es-CO', { timeZone: 'America/Bogota' })
       const m = msg.message
-
-      let texto = m.conversation || m.extendedTextMessage?.text ||
+      const texto = m.conversation || m.extendedTextMessage?.text ||
         (m.imageMessage ? `[Imagen] ${m.imageMessage.caption || ''}` : '') ||
         (m.documentMessage ? `[Documento: ${m.documentMessage.fileName}]` : '') ||
-        (m.audioMessage ? '[Audio recibido]' : '')
-
-      if (!texto || texto.length < 5) continue
-      console.log(`Mensaje de ${remitente}: ${texto.substring(0, 60)}`)
-
+        (m.audioMessage ? '[Audio recibido]' : '') || ''
+      if (texto.length < 5) continue
       const resultado = await analizarMensaje(texto, remitente, grupo)
       if (resultado.hay_tareas && resultado.tareas?.length) {
         for (const tarea of resultado.tareas) {
