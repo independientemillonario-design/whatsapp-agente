@@ -18,10 +18,10 @@ const server = createServer(async (req, res) => {
   if (qrActual) {
     const qrImg = await QRCode.toDataURL(qrActual)
     res.writeHead(200, { 'Content-Type': 'text/html' })
-    res.end(`<html><body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;background:#111;color:#fff"><h2>Escanea con WhatsApp</h2><img src="${qrImg}" style="width:300px;height:300px"/><p>Abre WhatsApp > Dispositivos vinculados > Vincular dispositivo</p></body></html>`)
+    res.end(`<html><head><meta http-equiv="refresh" content="5"></head><body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;background:#111;color:#fff"><h2>Escanea con WhatsApp</h2><img src="${qrImg}" style="width:300px;height:300px"/><p>Abre WhatsApp > Dispositivos vinculados > Vincular dispositivo</p></body></html>`)
   } else {
     res.writeHead(200, { 'Content-Type': 'text/html' })
-    res.end(`<html><body style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;background:#111;color:#fff"><h2>Conectado a WhatsApp</h2></body></html>`)
+    res.end(`<html><head><meta http-equiv="refresh" content="3"></head><body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;background:#111;color:#fff"><h2>Esperando QR...</h2><p style="color:#888">Esta página se actualiza sola cada 3 segundos</p></body></html>`)
   }
 })
 
